@@ -1,0 +1,186 @@
+#include <Wire.h>					// Librería para la comunicación I2C con la placa PCA9685
+#include <Adafruit_PWMServoDriver.h>// Librería para controlar el controlador de 16 servomotores
+#include <DHT.h>					// Librería para la lectura del sensor de temperatura y humedad
+
+// --- INSTANCIACIÓN DEL CONTROLADOR DE MOTORES ---
+Adafruit_PWMServoDriver pca = Adafruit_PWMServoDriver();
+
+// --- CALIBRACIÓN DE ANCHOS DE PULSO PARA SERVOS SG90 ---
+#define SERVOMIN  150 // Pulso mínimo (corresponde a aproximadamente 0 grados)
+#define SERVOMAX  600 // Pulso máximo (corresponde a aproximadamente 180 grados)
+
+// --- CONFIGURACIÓN DE LA MATRIZ DE ACTUADORES ---
+const int NUM_PATAS = 6;
+// Mapeo físico de pines de Coxas (bases) en los canales pares de la PCA9685
+const int PIN_COXA[NUM_PATAS]  = {0, 2, 4, 6, 8, 10}; 
+// Mapeo físico de pines de Fémures (articulación media) en los canales impares de la PCA9685
+const int PIN_FEMUR[NUM_PATAS] = {1, 3, 5, 7, 9, 11}; 
+
+// Vectores de memoria dinámica para almacenar la posición de cada servo en tiempo real
+int posActualCoxa[NUM_PATAS]  = {90, 90, 90, 90, 90, 90};
+int posActualFemur[NUM_PATAS] = {90, 90, 90, 90, 90, 90};
+
+const int TIEMPO_PASO = 8; // Retardo en milisegundos para suavizar el movimiento de los grados
+
+// --- CONFIGURACIÓN DE PINES DE LA PLACA ARDUINO PARA TELEMETRÍA ---
+const int PIN_TRIG = 2;       // Salida digital: Disparador del pulso ultrasónico
+const int PIN_ECHO = 3;       // Entrada digital: Receptor del eco ultrasónico
+const int PIN_DHT = 4;        // Entrada digital: Bus de datos del sensor de clima
+const int PIN_IR_OBJETO = 5;  // Entrada digital: Señal del sensor infrarrojo frontal
+
+// Definición del modelo del sensor ambiental
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT, DHTTYPE);
+
+void setup() {
+  // Inicialización del canal de comunicación de datos serial a 9600 baudios
+  Serial.begin(9600);
+  Serial.println("=== BIÓNICA ACTIVADA: MARCHA DE HORMIGA (TRÍPODE) ===");
+
+  // Inicialización de la placa controladora PWM por I2C
+  pca.begin();
+  pca.setPWMFreq(50); // Ajuste de la frecuencia de trabajo de los servos a 50Hz (estándar analógico)
+  delay(10);
+  
+  // Configuración de los modos de los pines del microcontrolador
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_IR_OBJETO, INPUT);
+  
+  // Inicialización del protocolo interno del sensor climático
+  dht.begin();
+  
+  // Rutina de Postura Inicial: Posiciona de forma segura los 12 motores a 90 grados
+  for (int i = 0; i < NUM_PATAS; i++) {
+    pca.setPWM(PIN_COXA[i],  0, map(90, 0, 180, SERVOMIN, SERVOMAX));
+    pca.setPWM(PIN_FEMUR[i], 0, map(90, 0, 180, SERVOMIN, SERVOMAX));
+  }
+  
+  delay(2000); // Tiempo de espera para la estabilización eléctrica de los componentes
+}
+
+void loop() {
+  // ==========================================================
+  // PASO 1: TRÍPODE GRUPO A EN EL AIRE / TRÍPODE GRUPO B EN EL SUELO
+  // ==========================================================
+  Serial.println("\n--- [Fase A] Grupo A en el aire, Grupo B empuja ---");
+  
+  // 1. Levanta verticalmente las patas del Grupo A mientras el Grupo B soporta el peso
+  moverTripode(70, 105, true); 
+  
+  // 2. Desplaza las Coxas del Grupo A adelante en el aire y contrae las del Grupo B atrás para avanzar el chasis
+  moverTripode(120, 60, true); 
+  
+  // 3. Baja las patas del Grupo A al suelo para consolidar el nuevo punto de apoyo
+  moverTripode(105, 105, true); 
+  
+  leerSensores(); // Adquisición y visualización de telemetría de entorno
+  delay(50);
+
+  // ==========================================================
+  // PASO 2: TRÍPODE GRUPO B EN EL AIRE / TRÍPODE GRUPO A EN EL SUELO
+  // ==========================================================
+  Serial.println("\n--- [Fase B] Grupo B en el aire, Grupo A empuja ---");
+  
+  // 1. Levanta verticalmente las patas del Grupo B mientras el Grupo A mantiene el chasis elevado
+  moverTripode(105, 70, false); 
+  
+  // 2. Desplaza las Coxas del Grupo B adelante por el aire y contrae las del Grupo A para propulsar el cuerpo
+  moverTripode(60, 120, false); 
+  
+  // 3. Asienta el Grupo B firmemente en el suelo para reiniciar el ciclo de caminata
+  moverTripode(105, 105, false); 
+
+  leerSensores(); // Adquisición y visualización de telemetría de entorno
+  delay(50);
+}
+
+// === FUNCIÓN CINEMÁTICA: GESTIONA LA ALTERNANCIA Y SIMETRÍA DEL ROBOT ===
+void moverTripode(int anguloGrupoA, int anguloGrupoB, bool moviendoGrupoA) {
+  int destCoxa[NUM_PATAS];
+  int destFemur[NUM_PATAS];
+
+  // Cálculo individual de trayectorias mecánicas para las 6 patas
+  for (int i = 0; i < NUM_PATAS; i++) {
+    // Identificación matemática del grupo: Índices pares = Grupo A, Índices impares = Grupo B
+    bool esGrupoA = (i % 2 == 0);
+    
+    int c_objetivo = 90;
+    int f_objetivo = 90;
+
+    // Asignación de roles cinemáticos según la fase activa del bucle principal
+    if (moviendoGrupoA) {
+      c_objetivo = esGrupoA ? anguloGrupoA : anguloGrupoB; 
+      f_objetivo = esGrupoA ? 70 : 105; 
+    } else {
+      c_objetivo = esGrupoA ? anguloGrupoB : anguloGrupoA;
+      f_objetivo = esGrupoA ? 105 : 70;
+    }
+
+    // Algoritmo matemático para corregir la inversión física del fémur
+    int f_corregido = (180 - f_objetivo) + 20;
+
+    // Algoritmo de espejo geométrico para las patas ubicadas en el lado izquierdo del chasis
+    if (i >= 3) {
+      destCoxa[i] = 180 - c_objetivo;
+      destFemur[i] = constrain(180 - f_corregido, 0, 180);
+    } else {
+      destCoxa[i] = c_objetivo;
+      destFemur[i] = constrain(f_corregido, 0, 180);
+    }
+  }
+
+  // Bucle de interpolación lineal: Modifica las posiciones grado a grado para un movimiento fluido
+  bool moviendose = true;
+  while (moviendose) {
+    moviendose = false;
+    for (int i = 0; i < NUM_PATAS; i++) {
+      // Ajuste progresivo y controlado de la Coxa
+      if (posActualCoxa[i] < destCoxa[i]) { posActualCoxa[i]++; moviendose = true; }
+      else if (posActualCoxa[i] > destCoxa[i]) { posActualCoxa[i]--; moviendose = true; }
+
+      // Ajuste progresivo y controlado del Fémur
+      if (posActualFemur[i] < destFemur[i]) { posActualFemur[i]++; moviendose = true; }
+      else if (posActualFemur[i] > destFemur[i]) { posActualFemur[i]--; moviendose = true; }
+
+      // Envío de la señal PWM calculada a la dirección correspondiente en la PCA9685
+      pca.setPWM(PIN_COXA[i],  0, map(posActualCoxa[i],  0, 180, SERVOMIN, SERVOMAX));
+      pca.setPWM(PIN_FEMUR[i], 0, map(posActualFemur[i], 0, 180, SERVOMIN, SERVOMAX));
+    }
+    delay(TIEMPO_PASO); // Control del retardo para calibrar la velocidad del paso
+  }
+}
+
+// === FUNCIÓN DE MUESTREO: ADQUISICIÓN DE DATOS DE EXPLORACIÓN ===
+void leerSensores() {
+  long duracion; float distancia;
+  // Generación de un pulso limpio de disparo en el emisor ultrasónico
+  digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  
+  // Medición del tiempo de retorno del eco con un límite de espera de 15 milisegundos
+  duracion = pulseIn(PIN_ECHO, HIGH, 15000); 
+  // Conversión del tiempo de respuesta físico a distancia en centímetros
+  distancia = (duracion * 0.0343) / 2;
+
+  // Formateo y transmisión de la lectura de distancia al Monitor Serie
+  Serial.print("   🐜 [Hormiga Telemetría] -> Obstáculo: ");
+  if (distancia >= 400 || distancia <= 2) { Serial.print("Libre"); } 
+  else { Serial.print(distancia); Serial.print(" cm"); }
+
+  // Captura de variables climatológicas a través del sensor DHT11
+  float humedad = dht.readHumidity();
+  float temperatura = dht.readTemperature();
+  
+  // Verificación y transmisión de los valores ambientales al puerto de salida
+  Serial.print(" | Clima: ");
+  if (isnan(humedad) || isnan(temperatura)) { Serial.print("Error"); } 
+  else { Serial.print(temperatura); Serial.print("C"); }
+
+  // Lectura digital del sensor óptico infrarrojo para la detección rápida de proximidad
+  int estadoObjeto = digitalRead(PIN_IR_OBJETO);
+  Serial.print(" | IR: ");
+  if (estadoObjeto == LOW) { Serial.println("⚠️ ALERTA OBSTÁCULO."); } 
+  else { Serial.println("Ok."); }
+}
